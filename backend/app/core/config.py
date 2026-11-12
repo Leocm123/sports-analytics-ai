@@ -11,6 +11,8 @@ Por que pydantic-settings?
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Caminho absoluto até backend/.env, para funcionar de qualquer pasta
@@ -33,6 +35,18 @@ class Settings(BaseSettings):
 
     # --- Banco (Neon) ---
     database_url: str = ""
+    @field_validator("database_url")
+    @classmethod
+    def usar_driver_psycopg(cls, valor: str) -> str:
+        """
+        O Neon entrega a URL como 'postgresql://...', mas o SQLAlchemy precisa
+        saber qual driver usar ('postgresql+psycopg://...'). Fazemos a troca
+        aqui para poder colar a string do Neon sem editar.
+        """
+        for prefixo in ("postgresql://", "postgres://"):
+            if valor.startswith(prefixo):
+                return "postgresql+psycopg://" + valor[len(prefixo):]
+        return valor
 
     # --- LLM (Fase 3) ---
     gemini_api_key: str = ""
