@@ -25,7 +25,18 @@ O **Sports Analytics AI** é uma plataforma de inteligência esportiva e anális
 
 ## 3. Especificação das Fontes de Dados
 
-### A. Dados Estruturados: API-Football v3 (Direto via API-Sports)
+### A0. DECISÃO (12/11/2026): Fonte principal da temporada atual = API pública da ESPN
+- **Motivo:** o plano Free da API-Football só libera as temporadas 2022–2024 (`"Free plans do not have access to this season, try from 2022 to 2024."`).
+- **Base:** `https://site.api.espn.com/apis/site/v2/sports/soccer/bra.1` — sem chave, sem cota fixa. Não oficial: isolar em `services/espn.py` atrás de uma interface de provedor, para poder trocar de fonte.
+- **Endpoints validados:**
+  - `GET /scoreboard` (jogos dos próximos dias) e `GET /scoreboard?dates=YYYYMMDD` (uma data só; **intervalo `A-B` retorna 400**)
+  - `GET /summary?event={id}` → `boxscore.teams[].statistics[]` (`name`/`displayValue`)
+- **Campos confirmados (jogo 401841302, Vitória x Fluminense, 06/11/2026):** `wonCorners`, `yellowCards`, `redCards`, `foulsCommitted`, `totalShots`, `shotsOnTarget`, `blockedShots`, `possessionPct`, `offsides`, `saves`, `totalCrosses`, `accurateCrosses`, passes, desarmes, interceptações, cortes.
+- **IDs:** times e eventos passam a usar os IDs da ESPN (não os da API-Football).
+- **A validar:** endpoint de standings, H2H e lesões/árbitro no `summary`.
+- **API-Football (2024):** mantida apenas como fonte de histórico/backtest (`SEASON=2024`).
+
+### A. Dados Estruturados (histórico): API-Football v3 (Direto via API-Sports)
 - **Base URL:** `https://v3.football.api-sports.io/`
 - **Autenticação (Header obrigatório):** `{"x-apisports-key": os.getenv("APISPORTS_KEY")}`
 - **Plano:** Free Tier direto no dashboard (`dashboard.api-football.com`) — **100 requisições/dia** (reset 00:00 UTC) e limite por minuto. Atenção: o free tier pode restringir o intervalo de temporadas acessíveis — validar `season=2026` com o script de teste.
@@ -142,4 +153,4 @@ sports-analytics-ai/
 - **Segurança:** Nunca hardcode chaves de API (`APISPORTS_KEY`, `GEMINI_API_KEY`, `DATABASE_URL`). Utilize sempre `pydantic-settings`.
 - **Idempotência no ETL:** Todos os scripts de ingestão devem usar `INSERT ... ON CONFLICT DO UPDATE` (Upsert) para evitar duplicação de partidas ou notícias caso o pipeline rode mais de uma vez.
 - **Respostas Estruturadas da IA:** Ao integrar com o Gemini, utilize Structured Outputs (JSON Schema) para garantir que o frontend receba campos previsíveis (`resumo_geral`, `tendencia_escanteios`, `tendencia_cartoes`, `tendencia_gols`, `alertas_desfalques`).
-- **Status atual:** Estrutura do `backend/`, `requirements.txt`, config e `scripts/test_connection.py` (`/status` + `/standings?league=71&season=2026`) criados. Próximo: DDL no Neon + carga inicial dos 20 times.
+- **Status atual:** Repositório em `~/dev/ProjetosPessoais/sports-analytics-ai` (WSL). Estrutura do `backend/`, config, `scripts/test_connection.py` (API-Football OK com chave válida) e `scripts/test_espn.py` (ESPN validada) prontos. Próximo: `services/espn.py` + mapear standings/H2H/lesões na ESPN, depois DDL no Neon (IDs da ESPN) e carga dos 20 times.
