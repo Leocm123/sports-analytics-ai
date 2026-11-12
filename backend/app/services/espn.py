@@ -21,7 +21,8 @@ Detalhe das URLs (a ESPN usa dois prefixos diferentes):
 - {base}/v2/sports/soccer/bra.1/standings -> classificação
 """
 
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -34,9 +35,24 @@ EstatisticasTime = dict[str, int | float | None]
 # Quantos caracteres do corpo da resposta mostrar nas mensagens de erro.
 LIMITE_TRECHO_ERRO = 300
 
+# Máximo de eventos pedidos por consulta ao scoreboard. CUIDADO: sem o
+# parâmetro `limit`, a ESPN devolve no máximo 100 eventos e CORTA O RESTO
+# SEM AVISAR (validado em 12/11/2026: `dates=2026` trouxe 100 de 383 jogos).
+# Um mês tem ~60 jogos, então 1000 dá bastante folga.
+LIMITE_EVENTOS = 1000
+
 
 class EspnError(Exception):
     """Erro ao falar com a ESPN: HTTP, rede, JSON inválido ou formato inesperado."""
+
+
+@dataclass(frozen=True)
+class Temporada:
+    """Período da temporada segundo o calendário da ESPN (primeiro e último dia com jogo)."""
+
+    ano: int
+    inicio: date
+    fim: date
 
 
 # ----------------------------------------------------------------------
@@ -129,6 +145,71 @@ def normalizar_boxscore(summary: dict) -> dict[int, EstatisticasTime]:
             if "name" in stat
         }
     return resultado
+
+
+def _competidor(competicao: dict, lado: str) -> dict:
+    """Devolve o time da casa (lado="home") ou o visitante (lado="away")."""
+    for competidor in competicao["competitors"]:
+        if competidor.get("homeAway") == lado:
+            return competidor
+    raise KeyError(f"competidor '{lado}' ausente")
+
+
+def _tem_placar(tipo_status: dict) -> bool:
+    """
+    True se o placar que a ESPN mandou é de verdade.
+
+    A ESPN manda score "0" até para jogo que nem começou ou que foi ADIADO.
+    Só confiamos no placar quando o jogo acabou (`completed`) ou está rolando
+    (`state == "in"`).
+
+    Cuidado com o adiado: ele vem com state "post" (como um jogo encerrado),
+    mas com completed=False. Por isso não basta olhar o state.
+    """
+    return bool(tipo_status.get("completed")) or tipo_status.get("state") == "in"
+
+
+def normalizar_evento(evento: dict) -> dict[str, Any]:
+    """
+    Converte um evento do scoreboard nas colunas da tabela `partidas`.
+
+    É o "contrato" com o ETL: o sync_round só enxerga este formato, nunca o
+    JSON cru da ESPN. Se a ESPN mudar, a correção fica só aqui.
+
+    Retorno:
+        {"id": 401841302, "rodada": None, "data_hora": datetime(..., tzinfo=UTC),
+         "status": "STATUS_FULL_TIME", "time_casa_id": 3457, "time_fora_id": 3445,
+         "gols_casa": 0, "gols_fora": 3}
+
+    - rodada: sempre None, porque a ESPN não informa a rodada. A view
+      `v_partidas` (sql/002_views.sql) deriva a rodada a partir dos IDs.
+    - status: o nome da ESPN ("STATUS_FULL_TIME", "STATUS_SCHEDULED",
+      "STATUS_POSTPONED"...).
+    - gols: None quando o jogo não começou ou foi adiado/cancelado.
+    """
+    try:
+        competicao = evento["competitions"][0]
+        casa = _competidor(competicao, "home")
+        fora = _competidor(competicao, "away")
+        tipo_status = evento["status"]["type"]
+        placar_valido = _tem_placar(tipo_status)
+        return {
+            "id": int(evento["id"]),
+            "rodada": None,
+            # A ESPN manda em UTC ("2026-11-14T21:30Z"). fromisoformat (Python 3.11+)
+            # entende o "Z" e devolve um datetime COM fuso, que o Postgres grava
+            # certinho na coluna TIMESTAMPTZ.
+            "data_hora": datetime.fromisoformat(evento["date"]),
+            "status": tipo_status["name"],
+            "time_casa_id": int(casa["team"]["id"]),
+            "time_fora_id": int(fora["team"]["id"]),
+            "gols_casa": _converter_valor(casa.get("score")) if placar_valido else None,
+            "gols_fora": _converter_valor(fora.get("score")) if placar_valido else None,
+        }
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as e:
+        raise EspnError(
+            f"Formato inesperado no evento {evento.get('id', '?')}: {e!r}"
+        ) from e
 
 
 def _nome_curto(time: dict) -> str:
@@ -258,18 +339,67 @@ class EspnClient:
     # ------------------------------------------------------------------
     # Endpoints
     # ------------------------------------------------------------------
+    def _scoreboard_bruto(self, params: dict[str, Any] | None = None) -> dict:
+        """JSON inteiro do scoreboard (eventos + dados da liga e da temporada)."""
+        return self._get(self._caminho_site("scoreboard"), params)
+
     def scoreboard(self, data: date | None = None) -> list[dict]:
         """
         Jogos de UMA data (ou, sem data, os jogos dos próximos dias).
 
-        A ESPN aceita só uma data por vez no formato YYYYMMDD. O formato de
-        intervalo "YYYYMMDD-YYYYMMDD" responde HTTP 400, então para cobrir
-        vários dias use `jogos_encerrados_desde`, que pede um dia de cada vez.
+        O formato de intervalo "YYYYMMDD-YYYYMMDD" responde HTTP 400. Para
+        cobrir vários dias, use `eventos_do_mes` ou `jogos_encerrados_desde`.
 
         Retorna a lista `events` já "desembrulhada" do JSON.
         """
         params = {"dates": data.strftime("%Y%m%d")} if data else None
-        return self._get(self._caminho_site("scoreboard"), params).get("events", [])
+        return self._scoreboard_bruto(params).get("events", [])
+
+    def eventos_do_mes(self, ano: int, mes: int) -> list[dict]:
+        """
+        Todos os jogos de um mês numa requisição só (`dates=YYYYMM`).
+
+        Por que por mês e não dia a dia? Os dados vêm igualmente atualizados
+        (o cache da ESPN dura de 1 a 10 segundos em qualquer formato), mas
+        um mês custa 1 requisição em vez de ~30.
+        """
+        params = {"dates": f"{ano}{mes:02d}", "limit": LIMITE_EVENTOS}
+        eventos = self._scoreboard_bruto(params).get("events", [])
+        if len(eventos) >= LIMITE_EVENTOS:
+            # Se bateu no limite, provavelmente a ESPN cortou jogos.
+            raise EspnError(
+                f"{ano}-{mes:02d}: a ESPN devolveu {len(eventos)} eventos, o "
+                f"limite pedido. Pode haver jogos cortados; aumente LIMITE_EVENTOS."
+            )
+        return eventos
+
+    def temporada(self) -> Temporada:
+        """
+        Primeiro e último dia COM JOGO da temporada atual.
+
+        Por que não usar `season.startDate/endDate`? Porque no Brasileirão eles
+        são só o ano-calendário (01/01 a 31/12). O dado útil está em
+        `leagues[0].calendar`: a lista dos dias que têm jogo (2026: de 28/01
+        a 02/12). Se o calendário vier vazio, usamos `season.*` como reserva.
+        """
+        dados = self._scoreboard_bruto()
+        try:
+            liga = dados["leagues"][0]
+            ano = int(liga["season"]["year"])
+            calendario = liga.get("calendar") or []
+            # Com calendarType "day", cada item é uma data em texto
+            # ("2026-01-28T08:00Z"). Outras ligas usam outro formato; nesse
+            # caso caímos no `season`.
+            if calendario and all(isinstance(dia, str) for dia in calendario):
+                dias = sorted(date.fromisoformat(dia[:10]) for dia in calendario)
+                return Temporada(ano=ano, inicio=dias[0], fim=dias[-1])
+            return Temporada(
+                ano=ano,
+                inicio=date.fromisoformat(liga["season"]["startDate"][:10]),
+                fim=date.fromisoformat(liga["season"]["endDate"][:10]),
+            )
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            raise EspnError(f"Formato inesperado no calendário da temporada: {e!r}") from e
 
     def jogos_encerrados_desde(self, dias: int, hoje: date | None = None) -> list[dict]:
         """
