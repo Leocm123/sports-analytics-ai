@@ -1,11 +1,15 @@
 """
-Cria o esquema do banco no Neon executando sql/001_init.sql.
+Cria ou atualiza o esquema do banco no Neon executando os arquivos sql/*.sql.
 
 Como rodar (a partir da pasta backend/):
     python -m scripts.init_db
 
-É seguro rodar mais de uma vez: o SQL usa IF NOT EXISTS em tudo, então a
-segunda execução não muda nada (é isso que chamamos de idempotente).
+Os arquivos rodam em ORDEM ALFABÉTICA (001_init.sql, 002_views.sql, ...).
+Por isso eles começam com um número: a ordem importa, porque as views do 002
+dependem das tabelas do 001.
+
+É seguro rodar mais de uma vez: os arquivos usam IF NOT EXISTS e
+CREATE OR REPLACE, então a segunda execução não muda nada (idempotente).
 """
 
 import sys
@@ -17,7 +21,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.config import BACKEND_DIR
 from app.core.db import get_engine
 
-ARQUIVO_SQL = BACKEND_DIR / "sql" / "001_init.sql"
+PASTA_SQL = BACKEND_DIR / "sql"
+
+
+def arquivos_sql(pasta: Path) -> list[Path]:
+    """Todos os .sql da pasta, em ordem alfabética (= ordem de execução)."""
+    return sorted(pasta.glob("*.sql"))
 
 
 def ler_sql(caminho: Path) -> str:
@@ -42,13 +51,18 @@ def executar_script_sql(conn: Connection, sql: str) -> None:
     conn.connection.driver_connection.execute(sql)
 
 
-def listar_tabelas(conn: Connection) -> list[str]:
-    """Tabelas do schema public, para conferir o resultado."""
+def listar_objetos(conn: Connection, tipo: str) -> list[str]:
+    """
+    Tabelas (tipo='BASE TABLE') ou views (tipo='VIEW') do schema public,
+    para conferir o resultado.
+    """
     resultado = conn.execute(
         text(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' ORDER BY table_name"
-        )
+            "WHERE table_schema = 'public' AND table_type = :tipo "
+            "ORDER BY table_name"
+        ),
+        {"tipo": tipo},
     )
     return list(resultado.scalars())
 
@@ -60,19 +74,33 @@ def versao_pgvector(conn: Connection) -> str | None:
     ).scalar_one_or_none()
 
 
+def aplicar_arquivo(caminho: Path) -> None:
+    """
+    Executa UM arquivo numa transação própria.
+
+    Uma transação por arquivo: se o 002 tiver um erro, o 001 continua
+    aplicado (e, como tudo é idempotente, basta corrigir e rodar de novo).
+    """
+    print(f"Executando {caminho.relative_to(BACKEND_DIR)} ...")
+    # begin(): abre uma transação e faz COMMIT no fim do bloco
+    # (ou ROLLBACK, se der erro no meio).
+    with get_engine().begin() as conn:
+        executar_script_sql(conn, ler_sql(caminho))
+
+
 def main() -> int:
-    print(f"Executando {ARQUIVO_SQL.relative_to(BACKEND_DIR)} ...")
-    try:
-        sql = ler_sql(ARQUIVO_SQL)
-        # begin(): abre uma transação e faz COMMIT no fim do bloco
-        # (ou ROLLBACK, se der erro no meio).
-        with get_engine().begin() as conn:
-            executar_script_sql(conn, sql)
-            tabelas = listar_tabelas(conn)
-            versao = versao_pgvector(conn)
-    except FileNotFoundError:
-        print(f"[ERRO] Arquivo não encontrado: {ARQUIVO_SQL}")
+    arquivos = arquivos_sql(PASTA_SQL)
+    if not arquivos:
+        print(f"[ERRO] Nenhum arquivo .sql em {PASTA_SQL}")
         return 1
+
+    try:
+        for caminho in arquivos:
+            aplicar_arquivo(caminho)
+        with get_engine().connect() as conn:
+            tabelas = listar_objetos(conn, "BASE TABLE")
+            views = listar_objetos(conn, "VIEW")
+            versao = versao_pgvector(conn)
     except (SQLAlchemyError, RuntimeError) as e:
         print(f"[ERRO de banco] {type(e).__name__}: {e}")
         return 1
@@ -81,7 +109,8 @@ def main() -> int:
         return 1
 
     print(f"OK. pgvector versão: {versao}")
-    print(f"Tabelas no schema public: {', '.join(tabelas) or '(nenhuma)'}")
+    print(f"Tabelas: {', '.join(tabelas) or '(nenhuma)'}")
+    print(f"Views:   {', '.join(views) or '(nenhuma)'}")
     return 0
 
 
