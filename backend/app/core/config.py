@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     league_id: int = 71  # Brasileirão Série A
     season: int = 2026
 
+    # --- ESPN (fonte principal da temporada atual) ---
+    # A base para em "/apis" de propósito: a ESPN usa DOIS prefixos diferentes
+    # a partir daqui. Quase tudo fica em "/site/v2/..." (scoreboard, summary,
+    # teams), mas a classificação fica em "/v2/..." (standings). O cliente
+    # (app/services/espn.py) monta o resto do caminho para cada caso.
+    espn_base_url: str = "https://site.api.espn.com/apis"
+    espn_league: str = "bra.1"  # código da ESPN para o Brasileirão Série A
+
     # --- Banco (Neon) ---
     database_url: str = ""
     @field_validator("database_url")
