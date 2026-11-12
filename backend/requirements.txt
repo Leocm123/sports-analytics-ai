@@ -16,6 +16,9 @@ sqlalchemy>=2.0
 psycopg[binary]>=3.2
 pgvector>=0.3
 
+# --- Testes (rodar a partir de backend/: pytest) ---
+pytest>=8.0
+
 # --- Fases 2 e 3 (RAG) — descomente quando chegar lá.
 # sentence-transformers puxa o PyTorch (~1-2 GB), por isso fica de fora no início.
 # sentence-transformers>=3.0
